@@ -28,9 +28,11 @@ This file contains persistent steering instructions, guidelines, and architectur
 
 ## 4. Analytics & Calculation Logic
 - **Daily Average Anchor Date:**
-  - The daily average calculation is strictly anchored to **15/09/2026** across all time horizon tabs:
-    $$\text{Days} = \max((\text{Today} - 2026\text{-}09\text{-}15) + 1, 1)$$
-    $$\text{Daily Average} = \frac{\text{Total Spent}}{\text{Days}}$$
+  - Tracking starts on **15/09/2026**. For a selected horizon, divide that horizon's spend by the smaller of its calendar-day length and the elapsed tracking days. Count elapsed days without adding one for the anchor date, with a minimum of one:
+    $$\text{Tracking Days} = \max(\text{Today} - 2026\text{-}09\text{-}15, 1)$$
+    $$\text{Days} = \min(\text{Horizon Days}, \text{Tracking Days})$$
+    $$\text{Daily Average} = \frac{\text{Selected Horizon Spend}}{\text{Days}}$$
+  - For **All Time**, use Tracking Days as Days.
 
 ---
 

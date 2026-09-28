@@ -63,6 +63,33 @@ with st.sidebar:
             elif new_cat:
                 st.warning("Category already exists or is invalid.")
 
+    st.markdown("---")
+    st.subheader("🎯 Monthly Category Budgets")
+    current_budgets = db.get_monthly_budgets()
+    if categories:
+        budget_category = st.selectbox("Budget category", options=categories, key="budget_category")
+        current_limit = current_budgets.get(budget_category, 0.0)
+        with st.form("budget_form", clear_on_submit=False):
+            budget_amount = st.number_input(
+                "Monthly limit (£)", min_value=0.01, step=0.01, format="%.2f",
+                value=max(current_limit, 0.01), key=f"monthly_budget_amount_{budget_category}",
+            )
+            save_budget = st.form_submit_button("Save Monthly Budget", use_container_width=True)
+            if save_budget:
+                db.set_monthly_budget(budget_category, budget_amount)
+                st.success(f"Monthly budget for {budget_category} saved.")
+                st.rerun()
+
+        if current_budgets:
+            remove_category = st.selectbox(
+                "Remove a budget", options=list(current_budgets),
+                format_func=lambda name: f"{name} (£{current_budgets[name]:,.2f}/month)",
+                key="remove_budget_category",
+            )
+            if st.button("Remove Selected Budget", use_container_width=True):
+                db.delete_monthly_budget(remove_category)
+                st.rerun()
+
 # Main Dashboard
 today = date.today()
 
@@ -76,12 +103,16 @@ filter_option = st.radio(
 )
 
 if filter_option == "Past 7 days":
-    start_date = today - timedelta(days=7)
+    period_days = 7
+    start_date = today - timedelta(days=period_days - 1)
 elif filter_option == "Past 30 days":
-    start_date = today - timedelta(days=30)
+    period_days = 30
+    start_date = today - timedelta(days=period_days - 1)
 elif filter_option == "Past 3 months":
-    start_date = today - timedelta(days=90)
+    period_days = 90
+    start_date = today - timedelta(days=period_days - 1)
 else:
+    period_days = None
     start_date = None
 
 expenses_data = db.get_expenses(start_date=start_date, end_date=today)
@@ -94,9 +125,11 @@ if not df.empty:
     # Top summary metrics
     total_spent = df["amount"].sum()
     
-    # Anchor date is strictly 15/09/2026 for all tabs
+    # Average the selected period's spend over elapsed days since tracking began,
+    # capped at the selected horizon, with a minimum denominator of one.
     anchor_date = date(2026, 9, 15)
-    days_count = max((today - anchor_date).days + 1, 1)
+    days_since_anchor = max((today - anchor_date).days, 1)
+    days_count = min(period_days, days_since_anchor) if period_days else days_since_anchor
     daily_avg = total_spent / days_count
 
     cat_totals = df.groupby("category")["amount"].sum().reset_index()
@@ -229,42 +262,57 @@ if not df.empty:
 
     with col_save:
         if st.button("💾 Save Table Changes", type="primary", use_container_width=True):
-            changes_detected = False
-            # Check for edits via st.session_state['expenses_editor'] as well as direct DataFrame diff
-            editor_changes = st.session_state.get("expenses_editor", {})
-            edited_rows_dict = editor_changes.get("edited_rows", {}) if isinstance(editor_changes, dict) else {}
-            deleted_rows_list = editor_changes.get("deleted_rows", []) if isinstance(editor_changes, dict) else {}
-
-            # Process all edited rows
             orig_dict = edit_df.set_index("id").to_dict(orient="index")
-            current_dict = edited_df.dropna(subset=["id"]).set_index("id").to_dict(orient="index")
+            updates = []
+            additions = []
+            invalid_rows = []
 
-            for exp_id, row in current_dict.items():
-                if exp_id in orig_dict:
-                    orig_row = orig_dict[exp_id]
-                    # Check any differences across all fields
-                    date_changed = str(row["expense_date"]) != str(orig_row["expense_date"])
-                    cat_changed = str(row["category"]) != str(orig_row["category"])
-                    amt_changed = abs(float(row["amount"]) - float(orig_row["amount"])) > 1e-4
-                    note_changed = str(row.get("notes") or "") != str(orig_row.get("notes") or "")
+            def is_blank(value):
+                return value is None or pd.isna(value) or (isinstance(value, str) and not value.strip())
 
-                    if date_changed or cat_changed or amt_changed or note_changed:
-                        db.update_expense(
-                            expense_id=int(exp_id),
-                            amount=float(row["amount"]),
-                            category=str(row["category"]),
-                            expense_date=row["expense_date"],
-                            notes=str(row.get("notes") or ""),
-                        )
-                        changes_detected = True
+            for _, row in edited_df.iterrows():
+                if not is_blank(row.get("id")):
+                    expense_id = int(row["id"])
+                    if expense_id not in orig_dict:
+                        continue
+                    orig_row = orig_dict[expense_id]
+                    changed = (
+                        str(row["expense_date"]) != str(orig_row["expense_date"])
+                        or str(row["category"]) != str(orig_row["category"])
+                        or abs(float(row["amount"]) - float(orig_row["amount"])) > 1e-4
+                        or str(row.get("notes") or "") != str(orig_row.get("notes") or "")
+                    )
+                    if changed:
+                        updates.append({"id": expense_id, **row.drop(labels=["id"]).to_dict()})
+                    continue
 
-            # Process deleted rows from keyboard shortcuts / row removals
-            deleted_ids = set(orig_dict.keys()) - set(current_dict.keys())
-            for d_id in deleted_ids:
-                db.delete_expense(int(d_id))
-                changes_detected = True
+                values = [row.get("expense_date"), row.get("category"), row.get("amount"), row.get("notes")]
+                if all(is_blank(value) for value in values):
+                    continue
+                if is_blank(row.get("expense_date")) or is_blank(row.get("category")) or is_blank(row.get("amount")):
+                    invalid_rows.append(str(len(additions) + 1))
+                    continue
+                try:
+                    amount_value = float(row["amount"])
+                    if amount_value <= 0 or str(row["category"]) not in all_categories:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    invalid_rows.append(str(len(additions) + 1))
+                    continue
+                additions.append({
+                    "expense_date": row["expense_date"],
+                    "category": str(row["category"]),
+                    "amount": amount_value,
+                    "notes": row.get("notes") or "",
+                })
 
-            if changes_detected:
+            current_ids = {int(value) for value in edited_df["id"] if not is_blank(value)}
+            deletions = sorted(set(orig_dict) - current_ids)
+
+            if invalid_rows:
+                st.error("Complete each new row with a valid date, category, and amount greater than £0.00 before saving.")
+            elif updates or additions or deletions:
+                db.save_expense_changes(updates, additions, deletions)
                 # Clear editor state to reset cell highlighting
                 if "expenses_editor" in st.session_state:
                     del st.session_state["expenses_editor"]
@@ -287,3 +335,156 @@ if not df.empty:
 
 else:
     st.info("💡 No expenses found for the selected time window. Add some using the left sidebar to see charts and analytics!")
+
+# Monthly spending history by category, independent of the selected dashboard horizon.
+st.markdown("---")
+st.subheader("📅 Spending Trends")
+monthly_data = db.get_expenses(end_date=today)
+monthly_df = pd.DataFrame(monthly_data)
+if not monthly_df.empty:
+    monthly_df["expense_datetime"] = pd.to_datetime(monthly_df["expense_date"])
+    monthly_df["month"] = monthly_df["expense_datetime"].dt.to_period("M").dt.to_timestamp()
+    trend_categories = sorted(monthly_df["category"].dropna().unique().tolist())
+    if "monthly_trend_categories" in st.session_state:
+        st.session_state["monthly_trend_categories"] = [
+            category for category in st.session_state["monthly_trend_categories"]
+            if category in trend_categories
+        ]
+    else:
+        st.session_state["monthly_trend_categories"] = trend_categories
+
+    trend_interval = st.radio(
+        "Trend interval",
+        options=["Weekly", "Monthly"],
+        horizontal=True,
+        key="spending_trend_interval",
+    )
+    if trend_interval == "Weekly":
+        monthly_df["period"] = monthly_df["expense_datetime"].dt.to_period("W-SUN").dt.start_time
+        period_label = "Week starting"
+        tick_format = "%d %b %Y"
+        tick_interval = "D7"
+    else:
+        monthly_df["period"] = monthly_df["month"]
+        period_label = "Month"
+        tick_format = "%b %Y"
+        tick_interval = "M1"
+
+    select_all_col, deselect_all_col, _ = st.columns([1, 1, 4])
+    with select_all_col:
+        if st.button("Select all", key="select_all_trend_categories"):
+            st.session_state["monthly_trend_categories"] = trend_categories
+    with deselect_all_col:
+        if st.button("Deselect all", key="deselect_all_trend_categories"):
+            st.session_state["monthly_trend_categories"] = []
+
+    selected_trend_categories = st.multiselect(
+        "Categories included in spending trends",
+        options=trend_categories,
+        help="Choose which categories contribute to period totals and the category breakdown.",
+        key="monthly_trend_categories",
+    )
+    if selected_trend_categories:
+        trend_df = monthly_df[monthly_df["category"].isin(selected_trend_categories)]
+        period_totals = (
+            trend_df.groupby("period", as_index=False)["amount"].sum()
+            .sort_values("period")
+        )
+        total_fig = px.bar(
+            period_totals,
+            x="period",
+            y="amount",
+            labels={"period": period_label, "amount": "Total spend (£)"},
+            title=f"Total spending by {trend_interval.lower()}",
+        )
+        total_fig.update_traces(
+            texttemplate="£%{y:,.2f}",
+            textposition="outside",
+            hovertemplate="%{x|" + tick_format + "}<br>Total: £%{y:,.2f}<extra></extra>",
+        )
+        total_fig.update_layout(
+            showlegend=False,
+            xaxis=dict(tickformat=tick_format, dtick=tick_interval),
+            yaxis_title="Total spent (£)",
+            margin=dict(t=45, b=10, l=10, r=10),
+        )
+        st.plotly_chart(total_fig, use_container_width=True)
+
+        category_totals = (
+            trend_df.groupby(["period", "category"], as_index=False)["amount"].sum()
+            .sort_values("period")
+        )
+        category_fig = px.bar(
+            category_totals,
+            x="period",
+            y="amount",
+            color="category",
+            barmode="stack",
+            labels={"period": period_label, "amount": "Spend (£)", "category": "Category"},
+            title=f"Spending by category, {trend_interval.lower()}",
+            color_discrete_sequence=px.colors.qualitative.Safe,
+        )
+        category_fig.update_traces(
+            hovertemplate="%{x|" + tick_format + "}<br>Spend: £%{y:,.2f}<extra>%{fullData.name}</extra>",
+        )
+        category_fig.update_layout(
+            xaxis=dict(tickformat=tick_format, dtick=tick_interval),
+            yaxis_title="Total spent (£)",
+            legend_title_text="Category",
+            margin=dict(t=45, b=10, l=10, r=10),
+        )
+        st.plotly_chart(category_fig, use_container_width=True)
+    else:
+        st.info("Select at least one category to display the monthly trend.")
+else:
+    st.info("Monthly spending will appear here once you record expenses.")
+
+# Current-month performance against configured category budgets.
+st.markdown("---")
+st.subheader("🎯 This Month’s Budget")
+monthly_budgets = db.get_monthly_budgets()
+if monthly_budgets:
+    month_start = today.replace(day=1)
+    month_expenses = db.get_expenses(start_date=month_start, end_date=today)
+    month_spend_df = pd.DataFrame(month_expenses)
+    spent_by_category = (
+        month_spend_df.groupby("category")["amount"].sum().to_dict()
+        if not month_spend_df.empty else {}
+    )
+    budget_total = sum(monthly_budgets.values())
+    budget_spent = sum(float(spent_by_category.get(category, 0.0)) for category in monthly_budgets)
+    remaining_total = budget_total - budget_spent
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("Budgeted", f"£{budget_total:,.2f}")
+    metric_columns[1].metric("Spent in Budgeted Categories", f"£{budget_spent:,.2f}")
+    metric_columns[2].metric("Remaining", f"£{remaining_total:,.2f}", delta=f"£{remaining_total:,.2f}")
+
+    budget_rows = []
+    for category, limit in sorted(monthly_budgets.items()):
+        spent = float(spent_by_category.get(category, 0.0))
+        remaining = limit - spent
+        budget_rows.append({
+            "Category": category,
+            "Budget (£)": limit,
+            "Spent (£)": spent,
+            "Remaining (£)": remaining,
+            "Used (%)": min(spent / limit, 1.0),
+        })
+    st.dataframe(
+        pd.DataFrame(budget_rows),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Budget (£)": st.column_config.NumberColumn(format="£%.2f"),
+            "Spent (£)": st.column_config.NumberColumn(format="£%.2f"),
+            "Remaining (£)": st.column_config.NumberColumn(format="£%.2f"),
+            "Used (%)": st.column_config.ProgressColumn(
+                "Used", min_value=0, max_value=1, format="percent",
+            ),
+        },
+    )
+    over_budget = [row["Category"] for row in budget_rows if row["Remaining (£)"] < 0]
+    if over_budget:
+        st.warning("Over budget: " + ", ".join(over_budget))
+else:
+    st.info("Set monthly limits by category in the sidebar to track your budget.")

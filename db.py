@@ -42,6 +42,12 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_budgets (
+                category TEXT PRIMARY KEY,
+                amount REAL NOT NULL CHECK (amount > 0)
+            )
+        """)
         # Populate default categories if table is empty
         cursor.execute("SELECT COUNT(*) as count FROM categories")
         if cursor.fetchone()["count"] == 0:
@@ -56,6 +62,28 @@ def get_categories() -> List[str]:
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM categories ORDER BY name ASC")
         return [row["name"] for row in cursor.fetchall()]
+
+def get_monthly_budgets() -> Dict[str, float]:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT category, amount FROM monthly_budgets ORDER BY category ASC")
+        return {row["category"]: float(row["amount"]) for row in cursor.fetchall()}
+
+def set_monthly_budget(category: str, amount: float):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO monthly_budgets (category, amount) VALUES (?, ?)
+               ON CONFLICT(category) DO UPDATE SET amount = excluded.amount""",
+            (category, float(amount)),
+        )
+        conn.commit()
+
+def delete_monthly_budget(category: str):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM monthly_budgets WHERE category = ?", (category,))
+        conn.commit()
 
 def add_category(name: str) -> bool:
     clean_name = name.strip()
@@ -121,3 +149,23 @@ def delete_expense(expense_id: int):
         cursor.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
         conn.commit()
 
+def save_expense_changes(updates: List[Dict[str, Any]], additions: List[Dict[str, Any]], deletions: List[int]):
+    """Apply a table-editor save as one database transaction."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        for row in updates:
+            expense_date = row["expense_date"]
+            cursor.execute(
+                """UPDATE expenses SET amount = ?, category = ?, expense_date = ?, notes = ?
+                   WHERE id = ?""",
+                (float(row["amount"]), str(row["category"]), expense_date.isoformat() if isinstance(expense_date, (date, datetime)) else str(expense_date), str(row.get("notes") or ""), int(row["id"])),
+            )
+        for row in additions:
+            expense_date = row["expense_date"]
+            cursor.execute(
+                """INSERT INTO expenses (amount, category, expense_date, notes)
+                   VALUES (?, ?, ?, ?)""",
+                (float(row["amount"]), str(row["category"]), expense_date.isoformat() if isinstance(expense_date, (date, datetime)) else str(expense_date), str(row.get("notes") or "")),
+            )
+        cursor.executemany("DELETE FROM expenses WHERE id = ?", [(int(expense_id),) for expense_id in deletions])
+        conn.commit()
